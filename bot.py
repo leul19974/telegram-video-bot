@@ -7,24 +7,27 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 # Logging
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Get Telegram token from Railway env
+# Telegram token
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-# Download path
+# Download directory
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Send me a TikTok, Instagram, Reddit, X, or YouTube link (max 50MB).")
+    await update.message.reply_text(
+        "Send me a TikTok, Instagram, Reddit, X, or YouTube link (max 50MB)."
+    )
 
 
-async def download_video(url: str, file_path: str) -> str:
-    """Download video using yt-dlp and return the file path"""
+def download_video_blocking(url: str, file_path: str) -> str:
+    """Blocking function for yt-dlp download"""
     ydl_opts = {
         "outtmpl": file_path,
         "format": "mp4[filesize<50M]/best[filesize<50M]",
@@ -34,10 +37,18 @@ async def download_video(url: str, file_path: str) -> str:
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
+            # Get actual downloaded file path
+            if "requested_downloads" in info:
+                return info["requested_downloads"][0]["filepath"]
             return ydl.prepare_filename(info)
     except Exception as e:
         logger.error(f"Download error: {e}")
         return None
+
+
+async def download_video(url: str, file_path: str) -> str:
+    """Async wrapper for blocking yt-dlp download"""
+    return await asyncio.to_thread(download_video_blocking, url, file_path)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -46,18 +57,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Not a supported link.")
         return
 
-    file_path = os.path.join(DOWNLOAD_DIR, "%(title).50s.%(ext)s")
-
+    file_template = os.path.join(DOWNLOAD_DIR, "%(title).50s.%(ext)s")
     await update.message.reply_text("⏳ Downloading video...")
 
-    downloaded_file = await asyncio.to_thread(download_video, url, file_path)
+    downloaded_file = await download_video(url, file_template)
 
-    if not downloaded_file:
+    if not downloaded_file or not os.path.exists(downloaded_file):
         await update.message.reply_text("❌ Failed to download. Maybe >50MB or unsupported.")
         return
 
     try:
-        await update.message.reply_video(video=open(downloaded_file, "rb"))
+        # Send video
+        with open(downloaded_file, "rb") as f:
+            await update.message.reply_video(video=f)
         await update.message.reply_text("✅ Sent! File will be deleted in 10 minutes.")
 
         # Schedule deletion
@@ -82,7 +94,6 @@ def main():
         return
 
     app = Application.builder().token(TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
