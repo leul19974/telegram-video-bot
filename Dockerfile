@@ -1,18 +1,18 @@
-# Use official Python image
+# Use official Python slim image
 FROM python:3.11-slim
 
-# Set work directory
+# Set working directory
 WORKDIR /app
 
-# Copy code
+# Copy all files
 COPY . .
 
-# Install dependencies
+# Upgrade pip and install dependencies
 RUN pip install --upgrade pip
 RUN pip install -r requirements.txt
 
-# Set environment variable (can also set in Railway settings)
+# Set Telegram token as environment variable (also can set in Railway/Koyeb settings)
 ENV TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN
 
-# Run bot
+# Run the bot
 CMD ["python", "bot.py"]
