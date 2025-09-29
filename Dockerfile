@@ -1,20 +1,20 @@
-# Use official Python image
+# Use an official Python runtime as a parent image
 FROM python:3.13-slim
 
 # Set working directory
 WORKDIR /app
 
-# Copy project files
-COPY . /app
-
-# Upgrade pip
-RUN pip install --no-cache-dir --upgrade pip
+# Copy requirements file first for caching
+COPY requirements.txt .
 
 # Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Set environment variable for Python buffering
+# Copy the rest of your bot code
+COPY . .
+
+# Set environment variable for Python
 ENV PYTHONUNBUFFERED=1
 
-# Run the bot
+# Start the bot
 CMD ["python", "bot.py"]
