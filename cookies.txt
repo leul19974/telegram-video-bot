@@ -1,0 +1,3 @@
+# Netscape HTTP Cookie File
+.instagram.com   TRUE   /   FALSE   1696000000   sessionid   1234567890%3Aabcdefghijklmnopqrstuvwxyz%3A1
+.twitter.com     TRUE   /   FALSE   1696000000   auth_token  ABCDEFGHIJKLMNOPQRSTUVWXYZ123456
