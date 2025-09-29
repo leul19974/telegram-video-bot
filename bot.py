@@ -14,7 +14,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')  # Make sure this is set!
+TOKEN = os.environ.get('7979384382:AAFBilcp8cVHhXOm4OO_QVH4NKzQhlm8dt8')  # Make sure this is set!
 MAX_FILE_SIZE = 1000 * 1024 * 1024  # 1GB
 CACHE_DURATION = 10 * 60  # 10 minutes
 FILE_DELETE_DELAY = 60  # 1 minute
@@ -184,3 +184,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
