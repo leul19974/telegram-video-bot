@@ -1,18 +1,20 @@
-# Use official Python slim image
-FROM python:3.11-slim
+# Use official Python image
+FROM python:3.13-slim
 
 # Set working directory
 WORKDIR /app
 
-# Copy all files
-COPY . .
+# Copy project files
+COPY . /app
 
-# Upgrade pip and install dependencies
-RUN pip install --upgrade pip
-RUN pip install -r requirements.txt
+# Upgrade pip
+RUN pip install --no-cache-dir --upgrade pip
 
-# Set Telegram token as environment variable (also can set in Railway/Koyeb settings)
-ENV TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN
+# Install dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Set environment variable for Python buffering
+ENV PYTHONUNBUFFERED=1
 
 # Run the bot
 CMD ["python", "bot.py"]
