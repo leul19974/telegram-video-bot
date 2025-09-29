@@ -1,309 +1,282 @@
-#!/usr/bin/env python3
-"""
-Telegram Video Downloader Bot
-- Uses python-telegram-bot (v20.x) and yt-dlp
-- Presents quality options, enforces 50 MB upload limit
-- Stores BOT_TOKEN in environment variable BOT_TOKEN
-- Designed to run on Railway with: worker: python bot.py
-"""
-
 import os
-import logging
 import asyncio
-import tempfile
-import uuid
-from typing import Dict, Any, Optional, List
+import logging
+import yt_dlp
+import ffmpeg
+from datetime import datetime
 from pathlib import Path
-
-from yt_dlp import YoutubeDL, utils as ytdlp_utils
+from functools import partial
 from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    __version__ as ptb_version,
+    Update, InlineKeyboardButton, InlineKeyboardMarkup
 )
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
+    ApplicationBuilder, CommandHandler,
+    MessageHandler, CallbackQueryHandler,
+    filters, ContextTypes
 )
 
-# ---------- Configuration ----------
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-MAX_FILESIZE_BYTES = 50 * 1024 * 1024  # 50 MB
-SUPPORTED_PLATFORMS = (
-    "youtube.com",
-    "youtu.be",
-    "tiktok.com",
-    "instagram.com",
-    "x.com",
-    "twitter.com",
-    "reddit.com",
-    "v.redd.it",
-)
-PENDING: Dict[str, Dict[str, Any]] = {}
-# -----------------------------------
+# ===============================
+# CONFIG
+# ===============================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN not set. Please set environment variable.")
+
+DOWNLOAD_DIR = Path("downloads")
+DOWNLOAD_DIR.mkdir(exist_ok=True)
+MAX_FILE_SIZE_MB = 1000  # 1 GB limit for Telegram bots
+
+# Cache settings
+request_cache = {}  # {user_id: {"url":..., "formats":..., "expiry":...}}
+CACHE_TTL = 600  # 10 minutes
 
 # Logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-logger.info("Starting Telegram Video Downloader Bot (PTB %s)", ptb_version)
 
 
-# ---------------- Utility ----------------
-def url_is_supported(url: str) -> bool:
-    lower = url.lower()
-    return any(domain in lower for domain in SUPPORTED_PLATFORMS)
+# ===============================
+# HELPERS
+# ===============================
+
+async def cleanup_cache():
+    """Clean expired cache entries every minute."""
+    while True:
+        now = datetime.now().timestamp()
+        expired = [uid for uid, data in request_cache.items() if data["expiry"] < now]
+        for uid in expired:
+            del request_cache[uid]
+        await asyncio.sleep(60)
 
 
-async def ytdl_extract_info(url: str) -> Dict[str, Any]:
-    loop = asyncio.get_running_loop()
-
-    def _extract():
-        ydl_opts = {"quiet": True, "no_warnings": True}
-        with YoutubeDL(ydl_opts) as ydl:
-            return ydl.extract_info(url, download=False)
-
-    return await loop.run_in_executor(None, _extract)
+async def cache_request(user_id, url, formats):
+    """Save request to cache."""
+    request_cache[user_id] = {
+        "url": url,
+        "formats": formats,
+        "expiry": datetime.now().timestamp() + CACHE_TTL
+    }
 
 
-async def ytdl_download(url: str, format_id: str, outdir: str) -> Path:
-    loop = asyncio.get_running_loop()
-
-    def _download():
-        outtmpl = os.path.join(outdir, "%(title).200s.%(ext)s")
-        ydl_opts = {
-            "format": format_id,
-            "outtmpl": outtmpl,
-            "quiet": True,
-            "no_warnings": True,
-            "merge_output_format": "mp4",
-        }
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            try:
-                filename = ydl.prepare_filename(info)
-            except Exception:
-                filename = None
-            if filename and os.path.exists(filename):
-                return Path(filename)
-            files = list(Path(outdir).glob("*"))
-            if files:
-                return sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)[0]
-            raise FileNotFoundError("Download completed but file not found.")
-
-    return await loop.run_in_executor(None, _download)
+def get_cached_request(user_id):
+    """Return cached request if still valid."""
+    data = request_cache.get(user_id)
+    if data and datetime.now().timestamp() < data["expiry"]:
+        return data
+    return None
 
 
-async def convert_to_audio(input_path: Path, output_path: Path) -> Path:
-    loop = asyncio.get_running_loop()
-
-    def _convert():
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "extract_audio": True,
-            "format": "bestaudio/best",
-            "outtmpl": str(output_path),
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }
-            ],
-        }
-        with YoutubeDL(ydl_opts) as ydl:
-            ydl.process_info({"_filename": str(input_path)})
-        return output_path
-
-    return await loop.run_in_executor(None, _convert)
-
-
-def build_quality_keyboard(formats: List[Dict[str, Any]], token: str) -> InlineKeyboardMarkup:
-    resolutions = [1080, 720, 480, 360, 240]
-    chosen = {}
-    sorted_formats = sorted(formats, key=lambda f: (f.get("height") or 0, f.get("tbr") or 0), reverse=True)
-
-    for res in resolutions:
-        for f in sorted_formats:
-            h = f.get("height")
-            ext = f.get("ext", "")
-            if h and h >= res and ext in ("mp4", "m4a", "webm", "mkv"):
-                chosen[res] = f
-                break
-    if not chosen and sorted_formats:
-        chosen[sorted_formats[0].get("height", 0)] = sorted_formats[0]
-
-    buttons = []
-    for res in resolutions:
-        f = chosen.get(res)
-        if not f:
-            continue
-        filesize = f.get("filesize") or f.get("filesize_approx")
-        label = f"{res}p"
-        if filesize:
-            mb = round(filesize / (1024 * 1024), 2)
-            label += f" ({mb} MB)"
-        buttons.append([InlineKeyboardButton(label, callback_data=f"DL|{token}|{f.get('format_id')}")])
-
-    # Add audio option
-    buttons.append([InlineKeyboardButton("Audio (MP3)", callback_data=f"AUDIO|{token}")])
-
-    # Cancel
-    buttons.append([InlineKeyboardButton("Cancel", callback_data=f"CANCEL|{token}")])
-
-    return InlineKeyboardMarkup(buttons)
-
-
-# ---------------- Commands ----------------
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Hi! Send me a YouTube / TikTok / Instagram / X (Twitter) / Reddit video link.\n\n"
-        "I'll let you choose quality or extract audio (<= 50 MB).\n\n"
-        "Commands:\n/start - this message\n/help - usage and tips"
-    )
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Usage:\n1. Send a video URL (YouTube, TikTok, Instagram, X/Twitter, Reddit).\n"
-        "2. Choose quality or audio.\n3. I'll download and send if it's <= 50 MB.\n\n"
-        "Notes:\n• If file > 50 MB I'll cancel.\n• Runs best for short videos.\n"
-    )
-
-
-# ---------------- Handlers ----------------
-async def url_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    if not text.startswith("http"):
-        await update.message.reply_text("Please send a valid video URL.")
-        return
-    if not url_is_supported(text):
-        await update.message.reply_text("Unsupported URL. Supported: YouTube, TikTok, Instagram, X/Twitter, Reddit.")
-        return
-
-    await update.message.reply_text("Fetching available formats...")
-
+async def run_ffmpeg_convert(input_path: Path, output_path: Path):
+    """Convert video to mp3 using ffmpeg."""
     try:
-        info = await ytdl_extract_info(text)
+        (
+            ffmpeg
+            .input(str(input_path))
+            .output(str(output_path), format="mp3", audio_bitrate="192k")
+            .overwrite_output()
+            .run(quiet=True)
+        )
+        return output_path
     except Exception as e:
-        logger.exception("Failed to extract info: %s", e)
+        logger.error(f"FFmpeg conversion failed: {e}")
+        return None
+
+
+async def download_with_ytdlp(url, format_id, out_path):
+    """Download video/audio with yt-dlp."""
+    ydl_opts = {
+        "format": format_id,
+        "outtmpl": str(out_path),
+        "quiet": True,
+        "merge_output_format": "mp4",
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        return out_path
+    except Exception as e:
+        logger.error(f"yt-dlp download error: {e}")
+        return None
+
+
+async def fetch_formats(url: str):
+    """Fetch available formats for a given URL."""
+    ydl_opts = {"quiet": True}
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            formats = [
+                {
+                    "format_id": f["format_id"],
+                    "ext": f.get("ext"),
+                    "resolution": f.get("resolution") or f"{f.get('height')}p",
+                    "filesize": f.get("filesize")
+                }
+                for f in info.get("formats", [])
+                if f.get("vcodec") != "none" and f.get("acodec") != "none"
+            ]
+            return formats, info
+    except Exception as e:
+        logger.error(f"Failed to fetch formats: {e}")
+        return None, None
+
+
+async def delete_file_later(path: Path, delay: int = 60):
+    """Delete file from server after delay (not from Telegram)."""
+    await asyncio.sleep(delay)
+    try:
+        if path.exists():
+            path.unlink()
+            logger.info(f"Deleted file {path}")
+    except Exception as e:
+        logger.error(f"Failed to delete {path}: {e}")
+
+
+# ===============================
+# BOT HANDLERS
+# ===============================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "👋 Welcome to *Silence Downloader Bot*!\n\n"
+        "📥 Send me a link from YouTube, TikTok, Instagram, Twitter/X, or Reddit.\n"
+        "🎥 I will fetch available video qualities for you.\n"
+        "🎧 You can also convert the video to audio (MP3).\n\n"
+        "⚠️ Note: Max file size is 1GB.\n\n"
+        "Use /help for more info."
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "📌 *How to use Silence Downloader:*\n\n"
+        "1. Send me a video link (YouTube, TikTok, Instagram, Twitter, Reddit).\n"
+        "2. Choose the desired video quality.\n"
+        "3. Or select *Convert to Audio* to get MP3.\n"
+        "4. File will be sent (max 1GB).\n\n"
+        "✅ Files are auto-deleted from the server after 1 minute."
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text.strip()
+    user_id = update.message.from_user.id
+
+    await update.message.reply_text("🔎 Fetching available formats...")
+
+    formats, info = await fetch_formats(url)
+    if not formats:
         await update.message.reply_text("❌ Failed to fetch video info.")
         return
 
-    formats = info.get("formats") or []
-    video_formats = [f for f in formats if f.get("vcodec") and f.get("vcodec") != "none"]
-    if not video_formats:
-        await update.message.reply_text("No video formats available.")
-        return
+    # Cache the request
+    await cache_request(user_id, url, formats)
 
-    token = str(uuid.uuid4())
-    PENDING[token] = {"url": text, "formats": video_formats}
-    kb = build_quality_keyboard(video_formats, token)
-    await update.message.reply_text("Choose download option:", reply_markup=kb)
+    # Build buttons
+    buttons = []
+    for f in formats:
+        res = f["resolution"] or "N/A"
+        btn_text = f"{res} ({f['ext']})"
+        buttons.append(
+            [InlineKeyboardButton(btn_text, callback_data=f"video|{f['format_id']}")]
+        )
+
+    buttons.append([InlineKeyboardButton("🎧 Convert to Audio", callback_data="audio")])
+
+    reply_markup = InlineKeyboardMarkup(buttons)
+    await update.message.reply_text("📥 Select quality or convert:", reply_markup=reply_markup)
 
 
-async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = (query.data or "").split("|")
+    user_id = query.from_user.id
 
-    if len(data) < 2:
-        return
-    action, token = data[0], data[1]
-    pending = PENDING.get(token)
-
-    if not pending:
-        await query.edit_message_text("Request expired. Send the link again.")
+    # Get cached request or re-fetch
+    data = get_cached_request(user_id)
+    if not data:
+        await query.edit_message_text("⚠️ Request expired. Send the link again.")
         return
 
-    url = pending["url"]
-    temp_dir = tempfile.mkdtemp(prefix="tgdl_")
-    downloaded_path: Optional[Path] = None
+    url = data["url"]
+    formats = data["formats"]
 
-    if action == "CANCEL":
-        PENDING.pop(token, None)
-        await query.edit_message_text("❌ Cancelled.")
-        return
+    choice = query.data.split("|")
+    action = choice[0]
 
-    try:
-        if action == "DL":
-            format_id = data[2]
-            await query.edit_message_text("⬇️ Downloading video...")
-            downloaded_path = await ytdl_download(url, format_id, temp_dir)
+    if action == "video":
+        format_id = choice[1]
+        out_path = DOWNLOAD_DIR / f"{user_id}_{format_id}.mp4"
+        await query.edit_message_text("⬇️ Downloading video...")
 
-            if downloaded_path.stat().st_size > MAX_FILESIZE_BYTES:
-                await context.bot.send_message(query.message.chat_id, "❌ File too large (>50MB). Try lower quality.")
-                return
+        file_path = await download_with_ytdlp(url, format_id, out_path)
+        if not file_path or not file_path.exists():
+            await query.edit_message_text("❌ Failed to download video.")
+            return
 
-            with open(downloaded_path, "rb") as f:
-                await context.bot.send_video(query.message.chat_id, f, caption=f"Downloaded from {url}")
+        if file_path.stat().st_size > MAX_FILE_SIZE_MB * 1024 * 1024:
+            await query.edit_message_text("⚠️ File too large for Telegram.")
+            file_path.unlink(missing_ok=True)
+            return
 
-        elif action == "AUDIO":
-            await query.edit_message_text("🎵 Extracting audio...")
-            downloaded_path = await ytdl_download(url, "bestaudio/best", temp_dir)
-            audio_path = Path(temp_dir) / f"{downloaded_path.stem}.mp3"
-            audio_path = await convert_to_audio(downloaded_path, audio_path)
+        await context.bot.send_video(
+            chat_id=user_id, video=open(file_path, "rb"),
+            caption="✅ Here is your video!"
+        )
+        asyncio.create_task(delete_file_later(file_path))
 
-            if audio_path.stat().st_size > MAX_FILESIZE_BYTES:
-                await context.bot.send_message(query.message.chat_id, "❌ Audio file too large (>50MB).")
-                return
+    elif action == "audio":
+        out_path = DOWNLOAD_DIR / f"{user_id}_audio.mp3"
+        tmp_path = DOWNLOAD_DIR / f"{user_id}_tmp.mp4"
+        await query.edit_message_text("⬇️ Downloading & converting to audio...")
 
-            with open(audio_path, "rb") as f:
-                await context.bot.send_audio(query.message.chat_id, f, caption=f"Audio extracted from {url}")
+        # Pick best audio format
+        format_id = "bestaudio"
+        file_path = await download_with_ytdlp(url, format_id, tmp_path)
+        if not file_path or not file_path.exists():
+            await query.edit_message_text("❌ Failed to download audio.")
+            return
 
-    except Exception as e:
-        logger.exception("Error: %s", e)
-        await context.bot.send_message(query.message.chat_id, "❌ Failed to process this request.")
-    finally:
-        # Schedule deletion after 2 minutes
-        async def delayed_cleanup(path: Path, folder: str):
-            await asyncio.sleep(120)
-            try:
-                if path and path.exists():
-                    path.unlink(missing_ok=True)
-                for p in Path(folder).glob("*"):
-                    p.unlink(missing_ok=True)
-                Path(folder).rmdir()
-            except Exception:
-                pass
+        converted = await run_ffmpeg_convert(tmp_path, out_path)
+        tmp_path.unlink(missing_ok=True)
 
-        if downloaded_path:
-            asyncio.create_task(delayed_cleanup(downloaded_path, temp_dir))
+        if not converted or not converted.exists():
+            await query.edit_message_text("❌ Failed to convert audio.")
+            return
 
-        PENDING.pop(token, None)
+        if converted.stat().st_size > MAX_FILE_SIZE_MB * 1024 * 1024:
+            await query.edit_message_text("⚠️ Audio file too large for Telegram.")
+            converted.unlink(missing_ok=True)
+            return
 
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.exception("Exception: %s", context.error)
-    try:
-        if isinstance(update, Update) and update.effective_chat:
-            await context.bot.send_message(update.effective_chat.id, "⚠️ An unexpected error occurred.")
-    except Exception:
-        pass
+        await context.bot.send_audio(
+            chat_id=user_id, audio=open(converted, "rb"),
+            caption="🎧 Here is your audio!"
+        )
+        asyncio.create_task(delete_file_later(converted))
 
 
-# ---------------- Main ----------------
+# ===============================
+# MAIN ENTRY
+# ===============================
+
 def main():
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN not set.")
-        raise RuntimeError("BOT_TOKEN environment variable is required.")
-
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, url_message))
-    app.add_handler(CallbackQueryHandler(callback_query_handler))
-    app.add_error_handler(error_handler)
 
-    logger.info("Bot running...")
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(button_handler))
+
+    # Run cache cleaner
+    app.job_queue.run_repeating(lambda ctx: asyncio.create_task(cleanup_cache()), interval=60, first=60)
+
+    logger.info("Bot is running...")
     app.run_polling()
 
 
