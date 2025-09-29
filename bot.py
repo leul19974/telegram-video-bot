@@ -1,89 +1,72 @@
-#!/usr/bin/env python3
-"""
-Telegram Video Downloader Bot with Compression
-- Uses python-telegram-bot (v20.x) and yt-dlp
-- Presents quality options, enforces 50 MB upload limit
-- Offers compression if file is too big
-- Deletes local files after 2 minutes
-"""
-
 import os
 import logging
 import asyncio
-import tempfile
-import uuid
-from typing import Dict, Any, Optional, List
 from pathlib import Path
+from uuid import uuid4
 
-import ffmpeg
-from yt_dlp import YoutubeDL, utils as ytdlp_utils
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    __version__ as ptb_version,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    ApplicationBuilder,
+    Application,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
     ContextTypes,
     filters,
 )
+import yt_dlp
+import ffmpeg
 
-# ---------- Configuration ----------
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-MAX_FILESIZE_BYTES = 50 * 1024 * 1024  # 50 MB
-SUPPORTED_PLATFORMS = ("youtube.com", "youtu.be", "tiktok.com", "instagram.com", "x.com", "twitter.com", "reddit.com", "v.redd.it")
-PENDING: Dict[str, Dict[str, Any]] = {}  # in-memory mapping
-# -----------------------------------
-
-# Logging
+# --- Logging ---
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-logger.info("Starting Telegram Video Downloader Bot (PTB %s)", ptb_version)
 
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DOWNLOAD_DIR = Path("downloads")
+DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-# ---------- Utilities ----------
-def url_is_supported(url: str) -> bool:
-    return any(domain in url.lower() for domain in SUPPORTED_PLATFORMS)
+# --- Start / Help ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Send me a video link (YouTube, TikTok, Instagram, Twitter/X, Reddit).\n"
+        "I’ll let you choose quality, compress if needed, and send the video back.\n\n"
+        "⚠️ Max size: 50 MB (Telegram Bot API limit)."
+    )
 
+# --- Get available qualities ---
+def get_formats(url: str):
+    ydl_opts = {"quiet": True, "no_warnings": True, "listformats": True}
+    formats = []
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            for f in info.get("formats", []):
+                if f.get("vcodec") != "none" and f.get("acodec") != "none":
+                    if f.get("filesize") and f["filesize"] <= 200 * 1024 * 1024:  # <200MB
+                        label = f"{f['format_note']} - {round(f['filesize']/1024/1024, 1)} MB"
+                        formats.append((label, f["format_id"]))
+    except Exception as e:
+        logger.error(f"Format error: {e}")
+    return formats
 
-async def ytdl_extract_info(url: str) -> Dict[str, Any]:
+# --- Download video ---
+async def download_video(url: str, format_id: str, output_path: Path):
     loop = asyncio.get_running_loop()
-
-    def _extract():
-        with YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
-            return ydl.extract_info(url, download=False)
-
-    return await loop.run_in_executor(None, _extract)
-
-
-async def ytdl_download(url: str, format_id: str, outdir: str) -> Path:
-    loop = asyncio.get_running_loop()
-
     def _download():
-        outtmpl = os.path.join(outdir, "%(title).200s.%(ext)s")
-        opts = {
+        ydl_opts = {
             "format": format_id,
-            "outtmpl": outtmpl,
+            "outtmpl": str(output_path),
             "quiet": True,
-            "no_warnings": True,
-            "merge_output_format": "mp4",
         }
-        with YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            return Path(ydl.prepare_filename(info))
-
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        return output_path
     return await loop.run_in_executor(None, _download)
 
-
+# --- Safer compression ---
 async def compress_video(input_path: Path, output_path: Path, target_res: str = "720p") -> Path:
-    """Compress video with ffmpeg to a target resolution."""
     res_map = {
         "720p": "1280x720",
         "480p": "854x480",
@@ -92,12 +75,18 @@ async def compress_video(input_path: Path, output_path: Path, target_res: str = 
     scale = res_map.get(target_res, "854x480")
 
     loop = asyncio.get_running_loop()
-
     def _compress():
         (
             ffmpeg
             .input(str(input_path))
-            .output(str(output_path), vf=f"scale={scale}", vcodec="libx264", crf=28, preset="veryfast")
+            .output(
+                str(output_path),
+                vf=f"scale={scale}",
+                vcodec="libx264",
+                crf=32,              # higher = smaller file
+                preset="ultrafast",  # faster compression, less CPU
+                acodec="copy"        # don’t re-encode audio
+            )
             .overwrite_output()
             .run(quiet=True)
         )
@@ -105,138 +94,96 @@ async def compress_video(input_path: Path, output_path: Path, target_res: str = 
 
     return await loop.run_in_executor(None, _compress)
 
-
-async def delayed_cleanup(temp_dir: str, token: str, delay: int = 120):
-    await asyncio.sleep(delay)
-    try:
-        for p in Path(temp_dir).glob("*"):
-            p.unlink(missing_ok=True)
-        Path(temp_dir).rmdir()
-        PENDING.pop(token, None)
-        logger.info("Cleaned up %s", temp_dir)
-    except Exception as e:
-        logger.warning("Cleanup failed for %s: %s", temp_dir, e)
-
-
-def build_quality_keyboard(formats: List[Dict[str, Any]], token: str) -> InlineKeyboardMarkup:
-    resolutions = [1080, 720, 480, 360, 240]
-    sorted_formats = sorted(formats, key=lambda f: (f.get("height") or 0, f.get("tbr") or 0), reverse=True)
-
-    chosen = {}
-    for res in resolutions:
-        for f in sorted_formats:
-            if (f.get("height") or 0) >= res and f.get("ext") in ("mp4", "mkv", "webm"):
-                chosen[res] = f
-                break
-
-    buttons = []
-    for res, f in chosen.items():
-        filesize = f.get("filesize") or f.get("filesize_approx")
-        label = f"{res}p"
-        if filesize:
-            label += f" ({round(filesize/1024/1024,2)} MB)"
-        buttons.append([InlineKeyboardButton(label, callback_data=f"DL|{token}|{f['format_id']}")])
-
-    buttons.append([InlineKeyboardButton("Cancel", callback_data=f"CANCEL|{token}")])
-    return InlineKeyboardMarkup(buttons)
-
-
-# ---------- Handlers ----------
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hi! Send me a YouTube/TikTok/Instagram/X/Reddit video link and I’ll download it (≤50 MB).")
-
-
-async def url_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = (update.message.text or "").strip()
-    if not url_is_supported(url):
-        await update.message.reply_text("Unsupported URL. Use YouTube, TikTok, Instagram, X/Twitter, Reddit.")
+# --- Handle messages ---
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text.strip()
+    formats = get_formats(url)
+    if not formats:
+        await update.message.reply_text("❌ No downloadable formats found or site not supported.")
         return
 
-    await update.message.reply_text("Fetching formats...")
-    try:
-        info = await ytdl_extract_info(url)
-        formats = [f for f in info.get("formats", []) if f.get("vcodec") != "none"]
-        if not formats:
-            await update.message.reply_text("No video formats found.")
-            return
+    keyboard = [
+        [InlineKeyboardButton(label, callback_data=f"{url}|{fmt_id}")]
+        for label, fmt_id in formats[:10]  # limit to first 10 options
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("🎞 Select quality:", reply_markup=reply_markup)
 
-        token = str(uuid.uuid4())
-        PENDING[token] = {"url": url, "formats": formats, "chat_id": update.message.chat_id}
-        kb = build_quality_keyboard(formats, token)
-        await update.message.reply_text("Choose a quality:", reply_markup=kb)
-    except Exception:
-        await update.message.reply_text("Failed to fetch video info.")
-
-
-async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- Handle quality selection ---
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data.split("|")
 
-    if len(data) < 2:
-        return
+    url, format_id = query.data.split("|")
+    file_id = str(uuid4())
+    raw_path = DOWNLOAD_DIR / f"{file_id}.mp4"
+    comp_path = DOWNLOAD_DIR / f"{file_id}_c.mp4"
 
-    action, token = data[0], data[1]
-    pending = PENDING.get(token)
-    if not pending:
-        await query.edit_message_text("Request expired.")
-        return
+    try:
+        await query.edit_message_text("⬇️ Downloading...")
+        await download_video(url, format_id, raw_path)
 
-    chat_id = pending["chat_id"]
-    url = pending["url"]
+        size_mb = raw_path.stat().st_size / 1024 / 1024
+        if size_mb <= 50:
+            await query.edit_message_text("✅ Sending video...")
+            await query.message.reply_video(video=open(raw_path, "rb"))
+        else:
+            await query.edit_message_text(
+                f"⚠️ File is {round(size_mb,1)} MB (limit 50 MB).\n"
+                "Do you want me to compress it to 720p or 480p?"
+            )
+            keyboard = [
+                [InlineKeyboardButton("Compress 720p", callback_data=f"compress|{raw_path}|720p")],
+                [InlineKeyboardButton("Compress 480p", callback_data=f"compress|{raw_path}|480p")],
+            ]
+            await query.message.reply_text("Choose compression:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-    if action == "CANCEL":
-        PENDING.pop(token, None)
-        await query.edit_message_text("Cancelled.")
-        return
+    except Exception as e:
+        logger.error(f"Download error: {e}")
+        await query.edit_message_text("❌ Error while downloading video.")
 
-    if action == "DL" and len(data) == 3:
-        format_id = data[2]
-        temp_dir = tempfile.mkdtemp(prefix="tgdl_")
-        try:
-            path = await ytdl_download(url, format_id, temp_dir)
-            size = path.stat().st_size
-            if size > MAX_FILESIZE_BYTES:
-                kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Compress to 720p", callback_data=f"COMPRESS|{token}|720p")],
-                    [InlineKeyboardButton("Compress to 480p", callback_data=f"COMPRESS|{token}|480p")],
-                    [InlineKeyboardButton("Cancel", callback_data=f"CANCEL|{token}")]
-                ])
-                await context.bot.send_message(chat_id=chat_id, text=f"File is {round(size/1024/1024,2)} MB (>50 MB). Compress?", reply_markup=kb)
-                return
+# --- Handle compression choice ---
+async def compress_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
 
-            with open(path, "rb") as f:
-                await context.bot.send_video(chat_id=chat_id, video=f, caption=f"Size: {round(size/1024/1024,2)} MB")
-        finally:
-            asyncio.create_task(delayed_cleanup(temp_dir, token))
+    _, path_str, res = query.data.split("|")
+    raw_path = Path(path_str)
+    comp_path = raw_path.with_name(raw_path.stem + f"_{res}.mp4")
 
-    if action == "COMPRESS" and len(data) == 3:
-        resolution = data[2]
-        temp_dir = tempfile.mkdtemp(prefix="tgdl_")
-        try:
-            input_path = await ytdl_download(url, "best", temp_dir)
-            output_path = Path(temp_dir) / f"compressed_{resolution}.mp4"
-            await compress_video(input_path, output_path, resolution)
-            size = output_path.stat().st_size
-            if size > MAX_FILESIZE_BYTES:
-                await context.bot.send_message(chat_id=chat_id, text="Still too large even after compression.")
-                return
-            with open(output_path, "rb") as f:
-                await context.bot.send_video(chat_id=chat_id, video=f, caption=f"Compressed to {resolution}, size {round(size/1024/1024,2)} MB")
-        finally:
-            asyncio.create_task(delayed_cleanup(temp_dir, token))
+    try:
+        await query.edit_message_text(f"🗜 Compressing to {res}...")
+        await compress_video(raw_path, comp_path, res)
 
+        size_mb = comp_path.stat().st_size / 1024 / 1024
+        if size_mb <= 50:
+            await query.edit_message_text("✅ Sending compressed video...")
+            await query.message.reply_video(video=open(comp_path, "rb"))
+        else:
+            await query.edit_message_text(f"❌ Still too big ({round(size_mb,1)} MB). Try lower quality.")
 
+    except Exception as e:
+        logger.error(f"Compression error: {e}")
+        await query.edit_message_text("❌ Error while compressing video.")
+
+    finally:
+        # Clean up after 2 minutes
+        async def cleanup():
+            await asyncio.sleep(120)
+            for f in [raw_path, comp_path]:
+                if f.exists():
+                    f.unlink()
+        asyncio.create_task(cleanup())
+
+# --- Main ---
 def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is required.")
-
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, url_message))
-    app.add_handler(CallbackQueryHandler(callback_query_handler))
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(button_handler, pattern="^http"))
+    app.add_handler(CallbackQueryHandler(compress_handler, pattern="^compress"))
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
