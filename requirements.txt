@@ -1,3 +1,5 @@
 python-telegram-bot==20.3
 yt-dlp
-ffmpeg-python==0.2.0
+ffmpeg-python
+
+
