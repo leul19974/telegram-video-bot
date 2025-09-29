@@ -3,464 +3,324 @@ import logging
 import time
 import json
 import yt_dlp
-from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackQueryHandler, CallbackContext
-from telegram.error import TelegramError
+from datetime import timedelta
+from pathlib import Path
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
 
 # Enable logging
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Configuration
-TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-MAX_FILE_SIZE = 1000 * 1024 * 1024  # 1GB in bytes
-CACHE_DURATION = 10 * 60  # 10 minutes in seconds
-FILE_DELETE_DELAY = 60  # 1 minute in seconds
+# Config
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+MAX_FILE_SIZE = 1000 * 1024 * 1024  # 1 GB
+CACHE_DURATION = 10 * 60  # 10 minutes
+FILE_DELETE_DELAY = 60  # 1 minute
 
-# Cache dictionary to store video info
+# Cache
 video_cache = {}
 
 # Supported platforms
 SUPPORTED_PLATFORMS = [
-    'youtube.com', 'youtu.be',  # YouTube
-    'instagram.com', 'instagr.am',  # Instagram
-    'tiktok.com',  # TikTok
-    'twitter.com', 'x.com',  # Twitter/X
-    'reddit.com',  # Reddit
+    "youtube.com", "youtu.be",
+    "instagram.com", "instagr.am",
+    "tiktok.com",
+    "twitter.com", "x.com",
+    "reddit.com"
 ]
 
 # yt-dlp options
 YDL_OPTIONS = {
-    'format': 'best',
-    'outtmpl': '%(title)s.%(ext)s',
-    'quiet': True,
-    'no_warnings': True,
-    'noplaylist': True,
-    'nocheckcertificate': True,  # Add this to bypass SSL issues
-    'socket_timeout': 30,  # Add timeout
+    "format": "best",
+    "outtmpl": "temp_downloads/%(title).200s.%(ext)s",
+    "quiet": True,
+    "no_warnings": True,
+    "noplaylist": True,
+    "nocheckcertificate": True,
+    "socket_timeout": 30,
 }
 
-def is_supported_url(url: str) -> bool:
-    """Check if the URL is from a supported platform."""
-    return any(platform in url.lower() for platform in SUPPORTED_PLATFORMS)
 
-def get_video_info(url: str) -> dict:
-    """Fetch video information using yt-dlp."""
+def is_supported_url(url: str) -> bool:
+    return any(site in url.lower() for site in SUPPORTED_PLATFORMS)
+
+
+def get_video_info(url: str) -> dict | None:
+    """Extract video info using yt-dlp."""
     try:
         with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
             info = ydl.extract_info(url, download=False)
-            
-            # Extract necessary information
             video_data = {
-                'title': info.get('title', 'Unknown Title'),
-                'uploader': info.get('uploader', 'Unknown Uploader'),
-                'duration': info.get('duration', 0),
-                'thumbnail': info.get('thumbnail', None),
-                'formats': info.get('formats', []),
-                'url': url,
-                'timestamp': time.time()
+                "title": info.get("title", "Unknown Title"),
+                "uploader": info.get("uploader", "Unknown Uploader"),
+                "duration": info.get("duration", 0),
+                "thumbnail": info.get("thumbnail"),
+                "formats": info.get("formats", []),
+                "url": url,
+                "timestamp": time.time()
             }
-            
-            # Process formats to get available qualities
+
             video_formats = []
             audio_formats = []
-            
-            for fmt in info.get('formats', []):
+
+            for fmt in info.get("formats", []):
                 try:
-                    if fmt.get('vcodec') != 'none' and fmt.get('acodec') != 'none':  # Video with audio
-                        file_size = fmt.get('filesize') or fmt.get('filesize_approx', 0)
-                        if file_size <= MAX_FILE_SIZE:
-                            video_formats.append({
-                                'format_id': fmt.get('format_id'),
-                                'format_note': fmt.get('format_note', ''),
-                                'height': fmt.get('height', 0),
-                                'width': fmt.get('width', 0),
-                                'filesize': file_size,
-                                'ext': fmt.get('ext', 'mp4')
-                            })
-                    elif fmt.get('vcodec') == 'none' and fmt.get('acodec') != 'none':  # Audio only
-                        file_size = fmt.get('filesize') or fmt.get('filesize_approx', 0)
-                        if file_size <= MAX_FILE_SIZE:
-                            audio_formats.append({
-                                'format_id': fmt.get('format_id'),
-                                'abr': fmt.get('abr', 0),
-                                'filesize': file_size,
-                                'ext': fmt.get('ext', 'mp3')
-                            })
-                except Exception as e:
-                    logger.warning(f"Error processing format: {e}")
+                    filesize = fmt.get("filesize") or fmt.get("filesize_approx", 0)
+                    if filesize > MAX_FILE_SIZE:
+                        continue
+
+                    if fmt.get("vcodec") != "none" and fmt.get("acodec") != "none":
+                        video_formats.append({
+                            "format_id": fmt.get("format_id"),
+                            "height": fmt.get("height"),
+                            "filesize": filesize,
+                            "ext": fmt.get("ext", "mp4"),
+                        })
+                    elif fmt.get("vcodec") == "none" and fmt.get("acodec") != "none":
+                        audio_formats.append({
+                            "format_id": fmt.get("format_id"),
+                            "abr": fmt.get("abr", 0),
+                            "filesize": filesize,
+                            "ext": fmt.get("ext", "mp3"),
+                        })
+                except Exception:
                     continue
-            
-            # Remove duplicates and sort by quality
-            video_formats = list({v['format_id']: v for v in video_formats}.values())
-            video_formats.sort(key=lambda x: x.get('height', 0), reverse=True)
-            
-            audio_formats = list({a['format_id']: a for a in audio_formats}.values())
-            audio_formats.sort(key=lambda x: x.get('abr', 0), reverse=True)
-            
-            video_data['video_formats'] = video_formats
-            video_data['audio_formats'] = audio_formats
-            
+
+            # sort
+            video_formats = sorted(video_formats, key=lambda x: x.get("height", 0), reverse=True)
+            audio_formats = sorted(audio_formats, key=lambda x: x.get("abr", 0), reverse=True)
+
+            video_data["video_formats"] = video_formats
+            video_data["audio_formats"] = audio_formats
             return video_data
     except Exception as e:
-        logger.error(f"Error fetching video info: {e}")
+        logger.error(f"yt-dlp error: {e}")
         return None
 
-def start(update: Update, context: CallbackContext) -> None:
-    """Send a message when the command /start is issued."""
-    try:
-        update.message.reply_text(
-            "👋 Hello! I'm a video downloader bot.\n\n"
-            "Send me a link from YouTube, Instagram, TikTok, Twitter/X, or Reddit, "
-            "and I'll help you download it.\n\n"
-            "Use /help for more information."
-        )
-    except Exception as e:
-        logger.error(f"Error in start command: {e}")
 
-def help_command(update: Update, context: CallbackContext) -> None:
-    """Send a message when the command /help is issued."""
-    try:
-        update.message.reply_text(
-            "📖 *Help*\n\n"
-            "Simply send me a link from one of the supported platforms:\n"
-            "• YouTube\n"
-            "• Instagram\n"
-            "• TikTok\n"
-            "• Twitter/X\n"
-            "• Reddit\n\n"
-            "I'll show you a preview of the video and available download options.\n\n"
-            "You can choose different video qualities or download as audio (MP3).\n\n"
-            "⚠️ *Note:* Maximum file size is 1GB. Downloaded files are deleted after 1 minute.",
-            parse_mode='Markdown'
-        )
-    except Exception as e:
-        logger.error(f"Error in help command: {e}")
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Hello! I'm a video downloader bot.\n\n"
+        "Send me a link from YouTube, Instagram, TikTok, Twitter/X, or Reddit."
+    )
 
-def handle_url(update: Update, context: CallbackContext) -> None:
-    """Handle URL messages from users."""
-    try:
-        url = update.message.text
-        
-        if not is_supported_url(url):
-            update.message.reply_text(
-                "❌ This URL is not supported or invalid.\n\n"
-                "Please send a link from YouTube, Instagram, TikTok, Twitter/X, or Reddit."
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📖 *Help*\n\n"
+        "Send me a link from supported platforms and I'll show a preview "
+        "with options to download video or audio.\n\n"
+        "⚠️ Limit: 1GB file size.\n"
+        "Files are deleted from server after 1 minute.",
+        parse_mode="Markdown"
+    )
+
+
+async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text.strip()
+
+    if not is_supported_url(url):
+        await update.message.reply_text("❌ Unsupported URL. Try YouTube, Instagram, TikTok, Twitter/X, or Reddit.")
+        return
+
+    cache_key = hash(url)
+    if cache_key in video_cache and time.time() - video_cache[cache_key]["timestamp"] < CACHE_DURATION:
+        video_data = video_cache[cache_key]
+    else:
+        msg = await update.message.reply_text("⏳ Fetching video info...")
+        video_data = get_video_info(url)
+        if not video_data:
+            await msg.edit_text("❌ Failed to fetch video info.")
+            return
+        video_cache[cache_key] = video_data
+        await msg.delete()
+
+    await send_preview(update, context, video_data)
+
+
+async def send_preview(update: Update, context: ContextTypes.DEFAULT_TYPE, video_data: dict):
+    duration = video_data.get("duration", 0)
+    if duration:
+        mins, secs = divmod(duration, 60)
+        hrs, mins = divmod(mins, 60)
+        duration_str = f"{hrs:02d}:{mins:02d}:{secs:02d}" if hrs else f"{mins:02d}:{secs:02d}"
+    else:
+        duration_str = "Unknown"
+
+    caption = (
+        f"📹 *{video_data['title']}*\n"
+        f"👤 Uploader: {video_data['uploader']}\n"
+        f"⏱ Duration: {duration_str}\n\n"
+        "Select download option:"
+    )
+
+    keyboard = []
+    for fmt in video_data.get("video_formats", [])[:4]:
+        size = fmt["filesize"] / (1024 * 1024) if fmt["filesize"] else 0
+        btn_text = f"🎬 {fmt['height']}p ({size:.1f}MB)"
+        keyboard.append([InlineKeyboardButton(
+            btn_text,
+            callback_data=json.dumps({
+                "type": "video",
+                "url": video_data["url"],
+                "format_id": fmt["format_id"],
+                "ext": fmt["ext"],
+            })
+        )])
+
+    if video_data.get("audio_formats"):
+        best_audio = video_data["audio_formats"][0]
+        size = best_audio["filesize"] / (1024 * 1024) if best_audio["filesize"] else 0
+        keyboard.append([InlineKeyboardButton(
+            f"🎵 Audio MP3 ({size:.1f}MB)",
+            callback_data=json.dumps({
+                "type": "audio",
+                "url": video_data["url"],
+                "format_id": best_audio["format_id"],
+                "ext": "mp3",
+            })
+        )])
+
+    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data=json.dumps({"type": "cancel"}))])
+
+    if video_data.get("thumbnail"):
+        try:
+            await update.message.reply_photo(
+                photo=video_data["thumbnail"],
+                caption=caption,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard),
             )
             return
-        
-        # Check cache first
-        cache_key = hash(url)
-        if cache_key in video_cache and time.time() - video_cache[cache_key]['timestamp'] < CACHE_DURATION:
-            video_data = video_cache[cache_key]
-            logger.info(f"Using cached data for URL: {url}")
-        else:
-            # Send "processing" message
-            processing_msg = update.message.reply_text("⏳ Processing your link...")
-            
-            # Fetch video info
-            video_data = get_video_info(url)
-            
-            if not video_data:
-                try:
-                    processing_msg.edit_text("❌ Failed to fetch video information. Please try again later.")
-                except TelegramError:
-                    update.message.reply_text("❌ Failed to fetch video information. Please try again later.")
-                return
-            
-            # Cache the video data
-            video_cache[cache_key] = video_data
-            
-            # Edit the processing message
-            try:
-                processing_msg.delete()
-            except TelegramError:
-                pass
-        
-        # Send preview message
-        send_preview(update, context, video_data)
-    except Exception as e:
-        logger.error(f"Error handling URL: {e}")
-        update.message.reply_text("❌ An error occurred while processing your request. Please try again.")
+        except Exception:
+            pass
 
-def send_preview(update: Update, context: CallbackContext, video_data: dict) -> None:
-    """Send a preview message with video details and download options."""
+    await update.message.reply_text(caption, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
     try:
-        chat_id = update.effective_chat.id
-        
-        # Format duration
-        duration = video_data.get('duration', 0)
-        if duration:
-            hours, remainder = divmod(duration, 3600)
-            minutes, seconds = divmod(remainder, 60)
-            duration_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
-        else:
-            duration_str = "Unknown"
-        
-        # Create caption
-        caption = (
-            f"📹 *{video_data.get('title', 'Unknown Title')}*\n\n"
-            f"👤 *Uploader:* {video_data.get('uploader', 'Unknown Uploader')}\n"
-            f"⏱️ *Duration:* {duration_str}\n\n"
-            "Please select a download option:"
-        )
-        
-        # Create keyboard with download options
-        keyboard = []
-        
-        # Add video quality options
-        if video_data.get('video_formats'):
-            video_formats = video_data['video_formats'][:5]  # Limit to 5 options
-            for fmt in video_formats:
-                quality = f"{fmt.get('height', 0)}p"
-                file_size = fmt.get('filesize', 0)
-                size_str = f"{file_size / (1024 * 1024):.1f}MB" if file_size else "Unknown size"
-                keyboard.append([
-                    InlineKeyboardButton(
-                        f"🎬 Video: {quality} ({size_str})",
-                        callback_data=json.dumps({
-                            'type': 'video',
-                            'url': video_data['url'],
-                            'format_id': fmt['format_id'],
-                            'ext': fmt['ext']
-                        })
-                    )
-                ])
-        
-        # Add audio option
-        if video_data.get('audio_formats'):
-            audio_formats = video_data['audio_formats']
-            if audio_formats:
-                best_audio = audio_formats[0]
-                file_size = best_audio.get('filesize', 0)
-                size_str = f"{file_size / (1024 * 1024):.1f}MB" if file_size else "Unknown size"
-                keyboard.append([
-                    InlineKeyboardButton(
-                        f"🎵 Audio (MP3) ({size_str})",
-                        callback_data=json.dumps({
-                            'type': 'audio',
-                            'url': video_data['url'],
-                            'format_id': best_audio['format_id'],
-                            'ext': 'mp3'
-                        })
-                    )
-                ])
-        
-        # Add cancel button
-        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data=json.dumps({'type': 'cancel'}))])
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        # Send preview with thumbnail if available
-        thumbnail_url = video_data.get('thumbnail')
-        if thumbnail_url:
-            try:
-                context.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=thumbnail_url,
-                    caption=caption,
-                    parse_mode='Markdown',
-                    reply_markup=reply_markup
-                )
-            except TelegramError:
-                # If sending thumbnail fails, send text only
-                context.bot.send_message(
-                    chat_id=chat_id,
-                    text=caption,
-                    parse_mode='Markdown',
-                    reply_markup=reply_markup
-                )
-        else:
-            context.bot.send_message(
-                chat_id=chat_id,
-                text=caption,
-                parse_mode='Markdown',
-                reply_markup=reply_markup
+        data = json.loads(query.data)
+    except Exception:
+        await query.edit_message_text("❌ Invalid request.")
+        return
+
+    if data["type"] == "cancel":
+        await query.edit_message_text("❌ Cancelled.")
+        return
+
+    msg = await query.edit_message_text("⏳ Downloading...")
+
+    file_path = download_media(data)
+    if not file_path:
+        await msg.edit_text("❌ Failed to download.")
+        return
+
+    try:
+        if data["type"] == "video":
+            await context.bot.send_video(
+                chat_id=query.message.chat_id,
+                video=open(file_path, "rb"),
+                caption="✅ Here’s your video!"
             )
+        else:
+            await context.bot.send_audio(
+                chat_id=query.message.chat_id,
+                audio=open(file_path, "rb"),
+                caption="✅ Here’s your audio!"
+            )
+        await msg.edit_text("✅ Done!")
     except Exception as e:
-        logger.error(f"Error sending preview: {e}")
-        update.message.reply_text("❌ An error occurred while preparing the preview. Please try again.")
+        logger.error(f"Send file error: {e}")
+        await msg.edit_text("❌ Failed to send file (too large?)")
 
-def handle_callback_query(update: Update, context: CallbackContext) -> None:
-    """Handle callback queries from inline keyboards."""
-    try:
-        query = update.callback_query
-        query.answer()
-        
-        try:
-            data = json.loads(query.data)
-            action_type = data.get('type')
-            
-            if action_type == 'cancel':
-                query.edit_message_text("❌ Download cancelled.")
-                return
-            
-            # Send "processing" message
-            processing_msg = query.edit_message_text("⏳ Preparing your download...")
-            
-            # Download the video/audio
-            file_path = download_media(data)
-            
-            if not file_path:
-                processing_msg.edit_text("❌ Failed to download the media. Please try again.")
-                return
-            
-            # Send the file
-            try:
-                if action_type == 'video':
-                    with open(file_path, 'rb') as video_file:
-                        context.bot.send_video(
-                            chat_id=query.message.chat_id,
-                            video=video_file,
-                            caption="Here's your video! 🎬",
-                            timeout=120  # Increased timeout
-                        )
-                elif action_type == 'audio':
-                    with open(file_path, 'rb') as audio_file:
-                        context.bot.send_audio(
-                            chat_id=query.message.chat_id,
-                            audio=audio_file,
-                            caption="Here's your audio! 🎵",
-                            timeout=120  # Increased timeout
-                        )
-                
-                # Edit the processing message
-                processing_msg.edit_text("✅ Download completed!")
-                
-                # Schedule file deletion
-                context.job_queue.run_once(
-                    delete_file,
-                    FILE_DELETE_DELAY,
-                    context={'file_path': file_path},
-                    name=f"delete_{file_path.replace('/', '_')}"
-                )
-                
-            except TelegramError as e:
-                logger.error(f"Error sending file: {e}")
-                processing_msg.edit_text("❌ Failed to send the file. It might be too large for Telegram.")
-                
-                # Delete the file immediately if sending failed
-                try:
-                    os.remove(file_path)
-                except OSError:
-                    pass
-                    
-        except json.JSONDecodeError:
-            query.edit_message_text("❌ Invalid request. Please try again.")
-        except Exception as e:
-            logger.error(f"Error in callback query: {e}")
-            query.edit_message_text("❌ An error occurred. Please try again.")
-            
-    except Exception as e:
-        logger.error(f"Error handling callback query: {e}")
+    # Schedule delete
+    context.job_queue.run_once(delete_file, FILE_DELETE_DELAY, data={"file_path": file_path})
 
-def download_media(data: dict) -> str:
-    """Download media using yt-dlp."""
-    url = data.get('url')
-    format_id = data.get('format_id')
-    ext = data.get('ext')
-    
+
+def download_media(data: dict) -> str | None:
+    url, format_id, ext = data.get("url"), data.get("format_id"), data.get("ext")
     if not all([url, format_id, ext]):
         return None
-    
-    # Create a temporary directory if it doesn't exist
-    temp_dir = 'temp_downloads'
-    os.makedirs(temp_dir, exist_ok=True)
-    
-    # Prepare yt-dlp options
-    ydl_options = {
-        'format': format_id,
-        'outtmpl': f'{temp_dir}/%(title)s.%(ext)s',
-        'quiet': True,
-        'no_warnings': True,
-        'noplaylist': True,
-        'nocheckcertificate': True,
-        'socket_timeout': 30,
-        'postprocessors': []
-    }
-    
-    # Add postprocessor for audio conversion to MP3
-    if data.get('type') == 'audio':
-        ydl_options['postprocessors'] = [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
+
+    os.makedirs("temp_downloads", exist_ok=True)
+    ydl_opts = YDL_OPTIONS.copy()
+    ydl_opts.update({
+        "format": format_id,
+        "outtmpl": f"temp_downloads/%(title).200s.%(ext)s",
+    })
+    if data["type"] == "audio":
+        ydl_opts["postprocessors"] = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
         }]
-    
+
     try:
-        with yt_dlp.YoutubeDL(ydl_options) as ydl:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             filename = ydl.prepare_filename(info)
-            
-            # If we converted to MP3, adjust the filename
-            if data.get('type') == 'audio':
-                filename = os.path.splitext(filename)[0] + '.mp3'
-            
-            return filename
+            if data["type"] == "audio":
+                filename = Path(filename).with_suffix(".mp3")
+            return str(filename)
     except Exception as e:
-        logger.error(f"Error downloading media: {e}")
+        logger.error(f"yt-dlp download error: {e}")
         return None
 
-def delete_file(context: CallbackContext) -> None:
-    """Delete a file from the filesystem."""
-    try:
-        file_path = context.job.context.get('file_path')
-        if file_path and os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-                logger.info(f"Deleted file: {file_path}")
-            except OSError as e:
-                logger.error(f"Error deleting file {file_path}: {e}")
-    except Exception as e:
-        logger.error(f"Error in delete_file: {e}")
 
-def error_handler(update: Update, context: CallbackContext) -> None:
-    """Log errors caused by updates."""
-    logger.error(f"Update {update} caused error {context.error}")
+async def delete_file(context: ContextTypes.DEFAULT_TYPE):
+    file_path = context.job.data.get("file_path")
+    if file_path and Path(file_path).exists():
+        try:
+            Path(file_path).unlink()
+            logger.info(f"Deleted {file_path}")
+        except Exception as e:
+            logger.error(f"Delete error: {e}")
 
-def main() -> None:
-    """Start the bot."""
-    # Create the Updater and pass it your bot's token.
-    updater = Updater(TOKEN)
-    
-    # Get the dispatcher to register handlers
-    dispatcher = updater.dispatcher
-    
-    # Register command handlers
-    dispatcher.add_handler(CommandHandler("start", start))
-    dispatcher.add_handler(CommandHandler("help", help_command))
-    
-    # Register message handler for URLs
-    dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_url))
-    
-    # Register callback query handler
-    dispatcher.add_handler(CallbackQueryHandler(handle_callback_query))
-    
-    # Register error handler
-    dispatcher.add_error_handler(error_handler)
-    
-    # Clean up old cache entries periodically
-    def clean_cache(context: CallbackContext):
-        current_time = time.time()
-        keys_to_delete = [key for key, value in video_cache.items() 
-                         if current_time - value['timestamp'] > CACHE_DURATION]
-        for key in keys_to_delete:
-            del video_cache[key]
-        logger.info(f"Cleaned {len(keys_to_delete)} old cache entries")
-    
-    # Schedule cache cleaning every hour
-    updater.job_queue.run_repeating(clean_cache, interval=3600, first=3600)
-    
-    # Start the Bot
-    updater.start_polling()
-    logger.info("Bot started successfully!")
-    
-    # Run the bot until you press Ctrl-C
-    updater.idle()
 
-if __name__ == '__main__':
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Update {update} caused {context.error}")
+
+
+def main():
+    app = Application.builder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_error_handler(error_handler)
+
+    async def clean_cache(context: ContextTypes.DEFAULT_TYPE):
+        now = time.time()
+        to_del = [k for k, v in video_cache.items() if now - v["timestamp"] > CACHE_DURATION]
+        for k in to_del:
+            del video_cache[k]
+        logger.info(f"Cleaned {len(to_del)} cache entries")
+
+    app.job_queue.run_repeating(clean_cache, interval=3600, first=3600)
+
+    logger.info("Bot started ✅")
+    app.run_polling()
+
+
+if __name__ == "__main__":
     main()
